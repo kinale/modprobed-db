@@ -34,13 +34,40 @@ if [[ ! -d "$HOMEDIR" ]]; then
 fi
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOMEDIR/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOMEDIR/.local/share}"
 
-[[ ! -d "$XDG_CONFIG_HOME" ]] && mkdir "$XDG_CONFIG_HOME"
-CFG_FILE="$XDG_CONFIG_HOME/modprobed-db.conf"
+# a trailing slash must not defeat the path compares made during migration
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME%/}"
+XDG_DATA_HOME="${XDG_DATA_HOME%/}"
 
-# name change from modprobed_db --> modprobed-db so move existing configs
-[[ -f "$HOMEDIR/.config/modprobed_db.conf" ]] && 
-mv "$HOMEDIR/.config/modprobed_db.conf" "$CFG_FILE"
+CFG_DIR="$XDG_CONFIG_HOME/modprobed-db"
+CFG_FILE="$CFG_DIR/modprobed-db.conf"
+DATA_DIR="$XDG_DATA_HOME/modprobed-db"
+
+# escaped for use as the replacement half of a sed s|| expression below since a
+# home directory may legally contain a backslash, a pipe, or an ampersand
+DATA_DIR_SED=${DATA_DIR//\\/\\\\}
+DATA_DIR_SED=${DATA_DIR_SED//|/\\|}
+DATA_DIR_SED=${DATA_DIR_SED//&/\\&}
+
+# make a directory belonging to the invoking user rather than to root under sudo
+mkuserdir() {
+  [[ -d "$1" ]] && return 0
+  if [[ $EUID -eq 0 && -n "$USER" && "$USER" != root ]]; then
+    install -d -o "$USER" -g "$(id -g -n "$USER")" "$1"
+  else
+    mkdir -p "$1"
+  fi
+}
+
+mkuserdir "$CFG_DIR" || { echo "==> ERROR: Cannot create $CFG_DIR"; exit 1; }
+
+# the config used to live directly in XDG_CONFIG_HOME rather than in its own
+# directory under it, so relocate anything left over from those versions. the
+# current name is tried first so that it wins over the deprecated one
+for old in "$XDG_CONFIG_HOME/modprobed-db.conf" "$XDG_CONFIG_HOME/modprobed_db.conf"; do
+  [[ -f "$old" && ! -f "$CFG_FILE" ]] && mv "$old" "$CFG_FILE"
+done
 
 if [[ ! -f "$CFG_FILE" ]]; then
   echo '------------------------------------------------------------'
@@ -58,11 +85,56 @@ if [[ ! -f "$CFG_FILE" ]]; then
     echo ' Do NOT just blindly overwrite!'
     echo ' Note the differences in names (no underscore any more)!'
   fi
-  sed  "s|@HOME@|$HOMEDIR|" "$SKEL" >"$CFG_FILE"
+  mkuserdir "$DATA_DIR" || { echo "==> ERROR: Cannot create $DATA_DIR"; exit 1; }
+  sed  "s|@DATA_DIR@|$DATA_DIR_SED|" "$SKEL" >"$CFG_FILE"
+  # the redirection above is done by the root shell under sudo, so hand the
+  # fresh config to the user or they cannot edit IGNORE without sudo either
+  [[ $EUID -eq 0 && -n "$USER" && "$USER" != root ]] &&
+  chown "$USER:$(id -g -n "$USER")" "$CFG_FILE"
   echo '------------------------------------------------------------'
   exit 0
 else
   . "$CFG_FILE"
+
+  # stage the config that migration would need, so that a config we cannot
+  # rewrite is discovered before the database has been moved out from under it.
+  # writing via cat keeps the file's existing owner intact under sudo
+  stage_dbpath() {
+    if grep -qE '^[[:space:]]*DBPATH=' "$CFG_FILE"; then
+      sed "s|^[[:space:]]*DBPATH=.*|DBPATH=\"$DATA_DIR_SED\"|" "$CFG_FILE" >"$TMPCFG"
+    else
+      # predates the setting, or it was commented out: append rather than edit
+      cat "$CFG_FILE" >"$TMPCFG" && echo "DBPATH=\"$DATA_DIR\"" >>"$TMPCFG"
+    fi &&
+    # confirm the intended line really is there before anything is moved
+    grep -qxF "DBPATH=\"$DATA_DIR\"" "$TMPCFG"
+  }
+
+  # an empty DBPATH is a config predating the setting, which kept the database
+  # alongside the config itself. a trailing slash must not defeat the compare
+  DBP="${DBPATH:-$XDG_CONFIG_HOME}"
+  DBP="${DBP%/}"
+
+  # the database used to default to XDG_CONFIG_HOME, so move it (and any
+  # backups made by rebuild) to XDG_DATA_HOME where it belongs
+  if [[ "$DBP" = "$XDG_CONFIG_HOME" || "$DBP" = "$HOMEDIR/.config" ]] &&
+     [[ -f "$DBP/modprobed.db" && ! -f "$DATA_DIR/modprobed.db" ]]; then
+    TMPCFG=$(mktemp)
+    if [[ -w "$CFG_FILE" ]] && mkuserdir "$DATA_DIR" && stage_dbpath &&
+       mv "$DBP"/modprobed.db* "$DATA_DIR"/ &&
+       cat "$TMPCFG" >"$CFG_FILE"; then
+      echo "Database moved from $DBP to $DATA_DIR"
+      DBPATH="$DATA_DIR"
+    else
+      echo "==> WARNING: Cannot migrate the database to $DATA_DIR, still using $DBP"
+      DBPATH="$DBP"
+    fi
+    rm -f "$TMPCFG"
+  fi
+
+  # a config predating DBPATH, or one with the setting removed, gets the default
+  [[ -z "$DBPATH" ]] && DBPATH="$DATA_DIR"
+  [[ "$DBPATH" = "$DATA_DIR" ]] && mkuserdir "$DATA_DIR"
   DB="$DBPATH/modprobed.db"
 fi
 
